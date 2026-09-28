@@ -869,8 +869,9 @@ void Cluster::write_core(
     if (this->supports_dma_operations(chip_id, sz_in_bytes)) {
         this->driver_->dma_write_to_device(mem_ptr, sz_in_bytes, core.chip, core_coord, addr);
     } else {
-        const tt::umd::IoOrdering resolved_ordering = ordering.value_or(
-            core_coord.core_type == CoreType::DRAM ? tt::umd::IoOrdering::Relaxed : tt::umd::IoOrdering::Strict);
+        // CI experiment: keep every host write strictly ordered (bisect of the Blackhole profiler-build wedge).
+        const tt::umd::IoOrdering resolved_ordering = tt::umd::IoOrdering::Strict;
+        (void)ordering;
         this->driver_->write_to_device(mem_ptr, sz_in_bytes, core.chip, core_coord, addr, resolved_ordering);
     }
 

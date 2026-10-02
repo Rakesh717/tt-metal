@@ -175,13 +175,19 @@ ttnn::Tensor untilize(
         // Without it a ROW_MAJOR tensor is accepted only because it is empty, while the same tensor
         // at any non-zero size is rejected - measured, both ops.
         TT_FATAL(input_tensor.layout() == Layout::TILE, "Can only untilize tile major data");
-        // Same reason, for the sub_core_grids arguments. untilize_native sends a tensor to the
-        // native prim when it is sharded or already unpadded, and to untilize_with_unpadding
-        // otherwise; only the first of those validates these three, so repeat them under the same
-        // condition rather than for every empty input.
-        const bool takes_native_untilize =
-            input_tensor.is_sharded() || input_tensor.logical_shape() == input_tensor.padded_shape();
-        if (takes_native_untilize && sub_core_grids.has_value()) {
+        // An unpadded interleaved input is untilize_with_unpadding's, not the native prim's -
+        // untilize_native routes it there, and that op's own empty branch derives the output shard
+        // geometry from the grid. Handling it here instead rejected conversions that route accepts:
+        // [2, 3, 0] interleaved to a width-sharded output failed on a shard height of 32 against a
+        // physical height of 6, while the same call through untilize_with_unpadding succeeded.
+        // Delegate instead of duplicating that derivation a second time.
+        if (!input_tensor.is_sharded() && input_tensor.logical_shape() != input_tensor.padded_shape()) {
+            return operations::data_movement::untilize_native(
+                input_tensor, memory_config, use_multicore, sub_core_grids);
+        }
+        // Everything past here is what untilize_native would hand to the native prim, so its
+        // validation is the validation to repeat.
+        if (sub_core_grids.has_value()) {
             TT_FATAL(
                 input_tensor.memory_config().memory_layout() == TensorMemoryLayout::INTERLEAVED,
                 "Input memory layout must be interleaved when sub_core_grid argument provided");
@@ -192,13 +198,17 @@ ttnn::Tensor untilize(
                 use_multicore,
                 "sub_core_grid implementation only supported when use_multicore flag argument is set to true");
         }
+        const auto output_mem_config = memory_config.value_or(input_tensor.memory_config());
+        if (output_mem_config.memory_layout() == TensorMemoryLayout::BLOCK_SHARDED) {
+            TT_FATAL(output_mem_config.buffer_type() == BufferType::L1, "We don't support DRAM block sharding");
+        }
         return create_device_tensor(
             tt::tt_metal::TensorSpec(
                 input_tensor.logical_shape(),
                 tt::tt_metal::TensorLayout(
                     operations::data_movement::untilize_output_dtype(input_tensor.dtype()),
                     tt::tt_metal::PageConfig(Layout::ROW_MAJOR),
-                    memory_config.value_or(input_tensor.memory_config()))),
+                    output_mem_config)),
             input_tensor.device(),
             input_tensor.tensor_topology());
     }

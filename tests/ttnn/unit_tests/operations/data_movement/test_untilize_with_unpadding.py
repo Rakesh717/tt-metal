@@ -1413,3 +1413,78 @@ def test_untilize_with_unpadding_zero_volume_rejects_incompatible_sharded_output
 
     with expect_error(RuntimeError, "must be HEIGHT_SHARDED"):
         ttnn.untilize_with_unpadding(tilized, ttnn.Shape([4294967295, 63]), memory_config=block_sharded)
+
+
+# Output-memory-config handling on the empty path, each case measured against its non-empty twin.
+def _crs(x1=0, y1=0):
+    return ttnn.CoreRangeSet({ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(x1, y1))})
+
+
+def _sharded(layout, shard, grid, buffer_type=ttnn.BufferType.L1):
+    return ttnn.MemoryConfig(layout, buffer_type, ttnn.ShardSpec(grid, shard, ttnn.ShardOrientation.ROW_MAJOR))
+
+
+# A padded interleaved input belongs to untilize_with_unpadding, which derives the output shard
+# geometry. ttnn.untilize used to answer it from its own branch and reject the conversion.
+def test_untilize_zero_volume_padded_interleaved_to_width_sharded(device):
+    tilized = ttnn.from_torch(
+        torch.rand((2, 3, 0), dtype=torch.bfloat16), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device
+    )
+    width_sharded = _sharded(ttnn.TensorMemoryLayout.WIDTH_SHARDED, [32, 32], _crs())
+
+    output = ttnn.untilize(tilized, memory_config=width_sharded)
+
+    assert list(output.shape) == [2, 3, 0]
+    assert output.memory_config().memory_layout == ttnn.TensorMemoryLayout.WIDTH_SHARDED
+
+
+def test_untilize_zero_volume_rejects_dram_block_sharded_output(device, expect_error):
+    tilized = ttnn.from_torch(
+        torch.rand((0, 64), dtype=torch.bfloat16), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device
+    )
+    dram_block = _sharded(ttnn.TensorMemoryLayout.BLOCK_SHARDED, [32, 64], _crs(), ttnn.BufferType.DRAM)
+
+    with expect_error(RuntimeError, "don't support DRAM block sharding"):
+        ttnn.untilize(tilized, memory_config=dram_block)
+
+
+def test_untilize_with_unpadding_zero_volume_rejects_block_to_height_sharded(device, expect_error):
+    tilized = ttnn.from_torch(
+        torch.rand((0, 64), dtype=torch.bfloat16),
+        dtype=ttnn.bfloat16,
+        layout=ttnn.TILE_LAYOUT,
+        device=device,
+        memory_config=_sharded(ttnn.TensorMemoryLayout.BLOCK_SHARDED, [32, 32], _crs(x1=1)),
+    )
+    height_sharded = _sharded(ttnn.TensorMemoryLayout.HEIGHT_SHARDED, [32, 64], _crs())
+
+    with expect_error(RuntimeError, "must be BLOCK_SHARDED"):
+        ttnn.untilize_with_unpadding(tilized, ttnn.Shape([4294967295, 63]), memory_config=height_sharded)
+
+
+def test_untilize_with_unpadding_zero_volume_rejects_dram_height_sharded_output(device, expect_error):
+    tilized = ttnn.from_torch(
+        torch.rand((0, 64), dtype=torch.bfloat16),
+        dtype=ttnn.bfloat16,
+        layout=ttnn.TILE_LAYOUT,
+        device=device,
+        memory_config=_sharded(ttnn.TensorMemoryLayout.HEIGHT_SHARDED, [32, 64], _crs()),
+    )
+    dram_height = _sharded(ttnn.TensorMemoryLayout.HEIGHT_SHARDED, [32, 64], _crs(), ttnn.BufferType.DRAM)
+
+    with expect_error(RuntimeError, "must be in L1"):
+        ttnn.untilize_with_unpadding(tilized, ttnn.Shape([4294967295, 63]), memory_config=dram_height)
+
+
+# The caller's shard width of 32 needs four columns for a 128-wide output; the grid has two. The
+# device operation derives 64 from the grid, and so does the empty path now.
+def test_untilize_with_unpadding_zero_volume_derives_block_shard_width(device):
+    tilized = ttnn.from_torch(
+        torch.rand((0, 128), dtype=torch.bfloat16), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device
+    )
+    block_sharded = _sharded(ttnn.TensorMemoryLayout.BLOCK_SHARDED, [32, 32], _crs(x1=1))
+
+    output = ttnn.untilize_with_unpadding(tilized, ttnn.Shape([4294967295, 127]), memory_config=block_sharded)
+
+    assert list(output.shape) == [0, 128]
+    assert output.memory_config().shard_spec.shape == [32, 64]

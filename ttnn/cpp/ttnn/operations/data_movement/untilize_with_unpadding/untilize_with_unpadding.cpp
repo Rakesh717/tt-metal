@@ -179,27 +179,96 @@ Tensor untilize_with_unpadding(
             output_mem_config = MemoryConfig(
                 output_mem_config.memory_layout(), output_mem_config.buffer_type(), input_tensor.shard_spec());
         }
-        // A height-sharded input can only produce a height-sharded output; the device operation
-        // rejects any other sharded output and TensorSpec does not, because it checks the output's
-        // own geometry rather than whether the conversion is supported.
-        if (input_tensor.shard_spec().has_value() &&
-            input_tensor.memory_config().memory_layout() == TensorMemoryLayout::HEIGHT_SHARDED &&
-            output_mem_config.is_sharded()) {
-            TT_FATAL(
-                output_mem_config.memory_layout() == TensorMemoryLayout::HEIGHT_SHARDED,
-                "Output memory config layout must be HEIGHT_SHARDED when output is sharded but got {}",
-                output_mem_config.memory_layout());
+        // Which sharded output a sharded input may produce. TensorSpec checks the output's own
+        // geometry, not whether the conversion is supported, so these have to be repeated or an
+        // empty input accepts pairings that a non-empty one is refused.
+        if (input_tensor.shard_spec().has_value() && output_mem_config.is_sharded()) {
+            if (input_tensor.memory_config().memory_layout() == TensorMemoryLayout::HEIGHT_SHARDED) {
+                TT_FATAL(
+                    output_mem_config.memory_layout() == TensorMemoryLayout::HEIGHT_SHARDED,
+                    "Output memory config layout must be HEIGHT_SHARDED when output is sharded but got {}",
+                    output_mem_config.memory_layout());
+                // The sharded factory binds the output buffer as a dynamic L1 circular buffer.
+                TT_FATAL(
+                    output_mem_config.buffer_type() == BufferType::L1,
+                    "HEIGHT_SHARDED -> HEIGHT_SHARDED output must be in L1; got buffer_type={}",
+                    output_mem_config.buffer_type());
+            } else if (input_tensor.memory_config().memory_layout() == TensorMemoryLayout::BLOCK_SHARDED) {
+                const bool same_type = output_mem_config.memory_layout() == TensorMemoryLayout::BLOCK_SHARDED;
+                TT_FATAL(
+                    same_type || output_mem_config.memory_layout() == TensorMemoryLayout::WIDTH_SHARDED,
+                    "Output memory config layout ({}) must be BLOCK_SHARDED (or WIDTH_SHARDED with a "
+                    "matching column shard width) when input is BLOCK_SHARDED and output is sharded",
+                    output_mem_config.memory_layout());
+                if (same_type) {
+                    TT_FATAL(
+                        output_mem_config.buffer_type() == BufferType::L1,
+                        "BLOCK_SHARDED -> BLOCK_SHARDED output must be in L1; got buffer_type={}",
+                        output_mem_config.buffer_type());
+                }
+                // The device operation's remaining same-type check is an unbatched-only assert that
+                // divides by padded_shape[-2] * padded_shape[-1]. That product is 0 for an empty
+                // input, so it cannot be repeated here; "batch" has no meaning without elements.
+            }
         }
-        if (output_mem_config.memory_layout() == TensorMemoryLayout::WIDTH_SHARDED &&
-            output_mem_config.shard_spec().has_value()) {
+        // The output shard shape, derived exactly as the device operation derives it. Its own fused
+        // height is volume() / shape[-1], which is 0 / 0 for an empty output, so take the product of
+        // the leading dims - the same value whenever the width is non-zero.
+        if (output_mem_config.is_sharded() && output_mem_config.shard_spec().has_value()) {
             uint32_t fused_height = 1;
             for (size_t index = 0; index + 1 < output_shape.rank(); ++index) {
                 fused_height *= output_shape[index];
             }
+            const auto tile = input_tensor.tensor_spec().tile();
             ShardSpec output_shard_spec = output_mem_config.shard_spec().value();
-            output_shard_spec.shape = {fused_height, output_shard_spec.shape[1]};
-            output_mem_config =
-                MemoryConfig(output_mem_config.memory_layout(), output_mem_config.buffer_type(), output_shard_spec);
+            bool reshaped = true;
+            if (!input_tensor.memory_config().is_sharded()) {
+                // An interleaved input carries no shard to inherit, so the per-core extents come
+                // from the grid. Keeping the caller's shard width instead rejected conversions the
+                // normal path performs: [0, 128] onto a two-column grid needed width 64, not 32.
+                const CoreRange bbox = output_shard_spec.grid.bounding_box();
+                uint32_t grid_cols = bbox.end_coord.x - bbox.start_coord.x + 1;
+                uint32_t grid_rows = bbox.end_coord.y - bbox.start_coord.y + 1;
+                if (output_shard_spec.orientation != ShardOrientation::ROW_MAJOR) {
+                    std::swap(grid_cols, grid_rows);
+                }
+                const uint32_t num_cores = output_shard_spec.num_cores();
+                // A derived extent is 0 exactly when that axis of the output is empty, and no shard
+                // shape can hold a 0 - a zero-volume shard is rejected outright. Keep the caller's
+                // extent on such an axis; it is the only representable choice, and it is what made
+                // [2, 3, 0] onto a width-sharded output work before this derivation existed.
+                const auto or_callers = [](uint32_t derived, uint32_t callers) {
+                    return derived > 0 ? derived : callers;
+                };
+                const uint32_t shard_height = output_shard_spec.shape[0];
+                const uint32_t shard_width = output_shard_spec.shape[1];
+                if (output_mem_config.memory_layout() == TensorMemoryLayout::WIDTH_SHARDED) {
+                    output_shard_spec.shape = {
+                        or_callers(fused_height, shard_height),
+                        or_callers(
+                            tt::round_up(tt::div_up(output_shape[-1], num_cores), tile.get_width()), shard_width)};
+                } else if (output_mem_config.memory_layout() == TensorMemoryLayout::BLOCK_SHARDED) {
+                    output_shard_spec.shape = {
+                        or_callers(tt::round_up(tt::div_up(fused_height, grid_rows), tile.get_height()), shard_height),
+                        or_callers(
+                            tt::round_up(tt::div_up(output_shape[-1], grid_cols), tile.get_width()), shard_width)};
+                } else {
+                    output_shard_spec.shape = {
+                        or_callers(tt::round_up(tt::div_up(fused_height, num_cores), tile.get_height()), shard_height),
+                        shard_width};
+                }
+            } else if (output_mem_config.memory_layout() == TensorMemoryLayout::WIDTH_SHARDED) {
+                // A sharded input keeps its own shard width; only the height follows the unpadded
+                // output, and WIDTH_SHARDED is the one layout whose validation pins it exactly.
+                output_shard_spec.shape = {
+                    fused_height > 0 ? fused_height : output_shard_spec.shape[0], output_shard_spec.shape[1]};
+            } else {
+                reshaped = false;
+            }
+            if (reshaped) {
+                output_mem_config =
+                    MemoryConfig(output_mem_config.memory_layout(), output_mem_config.buffer_type(), output_shard_spec);
+            }
         }
         // Allocated rather than filled: there is no element to initialise, and going through a host
         // tensor would upload to the device, which fails outright inside trace capture and drops the

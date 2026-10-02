@@ -1488,3 +1488,45 @@ def test_untilize_with_unpadding_zero_volume_derives_block_shard_width(device):
 
     assert list(output.shape) == [0, 128]
     assert output.memory_config().shard_spec.shape == [32, 64]
+
+
+def test_untilize_zero_volume_rejects_narrow_shard_on_single_core(device, expect_error):
+    tilized = ttnn.from_torch(
+        torch.rand((0, 64), dtype=torch.bfloat16), dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=device
+    )
+    narrow = _sharded(ttnn.TensorMemoryLayout.BLOCK_SHARDED, [32, 16], _crs(x1=3))
+
+    with expect_error(RuntimeError, "must be a multiple of tile width"):
+        ttnn.untilize(tilized, memory_config=narrow, use_multicore=False)
+
+
+def test_untilize_with_unpadding_zero_volume_rejects_dram_width_sharded_output(device, expect_error):
+    tilized = ttnn.from_torch(
+        torch.rand((32, 0), dtype=torch.bfloat16),
+        dtype=ttnn.bfloat16,
+        layout=ttnn.TILE_LAYOUT,
+        device=device,
+        memory_config=_sharded(ttnn.TensorMemoryLayout.WIDTH_SHARDED, [32, 32], _crs()),
+    )
+    dram_width = _sharded(ttnn.TensorMemoryLayout.WIDTH_SHARDED, [32, 32], _crs(), ttnn.BufferType.DRAM)
+
+    with expect_error(RuntimeError, "must be in L1"):
+        ttnn.untilize_with_unpadding(tilized, ttnn.Shape([3, 4294967295]), memory_config=dram_width)
+
+
+# A same-layout output is reshaped from the input's shard, not the caller's: an explicit [32, 32]
+# cannot describe a 64-wide height-sharded output, and the non-empty call derives [32, 64] too.
+def test_untilize_with_unpadding_zero_volume_same_layout_output_follows_input_shard(device):
+    tilized = ttnn.from_torch(
+        torch.rand((0, 64), dtype=torch.bfloat16),
+        dtype=ttnn.bfloat16,
+        layout=ttnn.TILE_LAYOUT,
+        device=device,
+        memory_config=_sharded(ttnn.TensorMemoryLayout.HEIGHT_SHARDED, [32, 64], _crs()),
+    )
+    narrower = _sharded(ttnn.TensorMemoryLayout.HEIGHT_SHARDED, [32, 32], _crs())
+
+    output = ttnn.untilize_with_unpadding(tilized, ttnn.Shape([4294967295, 63]), memory_config=narrower)
+
+    assert list(output.shape) == [0, 64]
+    assert output.memory_config().shard_spec.shape == [32, 64]

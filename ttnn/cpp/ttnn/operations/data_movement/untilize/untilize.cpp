@@ -158,35 +158,22 @@ ttnn::Tensor untilize(
     using ttnn::operations::data_movement::untilize_codegen::supported_by_codegen;
     using ttnn::operations::data_movement::untilize_codegen::supported_execution_controls;
 
-    // Nothing to untilize. Both routes below split work by block count, which is 0 for an empty
-    // input, so neither emits a work unit while the dataflow buffers are already declared, and the
-    // spec is rejected. to_layout(TILE -> ROW_MAJOR) reaches here rather than
-    // untilize_with_unpadding whenever the padded shape already equals the logical one - a
-    // tile-aligned empty shape, or any sharded empty input. Allocate the output instead; untilize
-    // only changes layout, so the shape is the input's. Allocated, not filled: there is no element
-    // to initialise, a host upload would fail inside trace capture, and this keeps the input's mesh
-    // topology.
+    // Nothing to untilize. The routes below split work by block count, which is 0 for an empty
+    // input, so no work unit is emitted while the dataflow buffers are already declared and the
+    // spec is rejected. Allocate the output instead - not fill it, since a host upload fails inside
+    // trace capture and loses the input's mesh topology. Stands in for the device operation's
+    // validation, so it repeats the checks that apply.
     if (input_tensor.logical_volume() == 0) {
-        // device() is null for a host or unallocated tensor and create_device_tensor dereferences
-        // it; without this the empty branch segfaults where the normal path would have fallen
-        // through to the device operation's validation error.
+        // create_device_tensor dereferences the device, which is null for a host tensor.
         TT_FATAL(input_tensor.device() != nullptr, "untilize: input tensor must be allocated on a device");
-        // The shortcut skips the device operation's validation, so repeat its layout check here.
-        // Without it a ROW_MAJOR tensor is accepted only because it is empty, while the same tensor
-        // at any non-zero size is rejected - measured, both ops.
         TT_FATAL(input_tensor.layout() == Layout::TILE, "Can only untilize tile major data");
-        // An unpadded interleaved input is untilize_with_unpadding's, not the native prim's -
-        // untilize_native routes it there, and that op's own empty branch derives the output shard
-        // geometry from the grid. Handling it here instead rejected conversions that route accepts:
-        // [2, 3, 0] interleaved to a width-sharded output failed on a shard height of 32 against a
-        // physical height of 6, while the same call through untilize_with_unpadding succeeded.
-        // Delegate instead of duplicating that derivation a second time.
+        // A padded interleaved input belongs to untilize_with_unpadding, which derives the output
+        // shard geometry; delegate rather than duplicate that here.
         if (!input_tensor.is_sharded() && input_tensor.logical_shape() != input_tensor.padded_shape()) {
             return operations::data_movement::untilize_native(
                 input_tensor, memory_config, use_multicore, sub_core_grids);
         }
-        // Everything past here is what untilize_native would hand to the native prim, so its
-        // validation is the validation to repeat.
+        // Everything past here is what untilize_native hands to the native prim.
         if (sub_core_grids.has_value()) {
             TT_FATAL(
                 input_tensor.memory_config().memory_layout() == TensorMemoryLayout::INTERLEAVED,
@@ -201,6 +188,20 @@ ttnn::Tensor untilize(
         const auto output_mem_config = memory_config.value_or(input_tensor.memory_config());
         if (output_mem_config.memory_layout() == TensorMemoryLayout::BLOCK_SHARDED) {
             TT_FATAL(output_mem_config.buffer_type() == BufferType::L1, "We don't support DRAM block sharding");
+        }
+        // The single-core implementation cannot write an output shard narrower than a tile.
+        if (!use_multicore && output_mem_config.is_sharded()) {
+            TT_FATAL(
+                output_mem_config.shard_spec().has_value() || output_mem_config.nd_shard_spec().has_value(),
+                "Output memory config is sharded but no shard spec or nd shard spec is provided");
+            const uint32_t output_shard_width = output_mem_config.shard_spec().has_value()
+                                                    ? output_mem_config.shard_spec().value().shape[1]
+                                                    : output_mem_config.nd_shard_spec().value().shard_shape[-1];
+            TT_FATAL(
+                output_shard_width % tt::constants::TILE_WIDTH == 0,
+                "Output shard width {} must be a multiple of tile width {} for single core implementation",
+                output_shard_width,
+                tt::constants::TILE_WIDTH);
         }
         return create_device_tensor(
             tt::tt_metal::TensorSpec(

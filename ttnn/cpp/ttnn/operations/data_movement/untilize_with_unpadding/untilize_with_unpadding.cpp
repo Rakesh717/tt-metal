@@ -177,7 +177,7 @@ Tensor untilize_with_unpadding(
             !output_mem_config.shard_spec().has_value() &&
             output_mem_config.memory_layout() == input_tensor.memory_config().memory_layout()) {
             output_mem_config = MemoryConfig(
-                output_mem_config.memory_layout(), output_mem_config.buffer_type(), input_tensor.shard_spec().value());
+                output_mem_config.memory_layout(), output_mem_config.buffer_type(), input_tensor.shard_spec());
         }
         // A height-sharded input can only produce a height-sharded output; the device operation
         // rejects any other sharded output and TensorSpec does not, because it checks the output's

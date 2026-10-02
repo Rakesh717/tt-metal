@@ -120,6 +120,11 @@ Tensor untilize_with_unpadding(
         // Without it a ROW_MAJOR tensor is accepted only because it is empty, while the same tensor
         // at any non-zero size is rejected - measured, both ops.
         TT_FATAL(input_tensor.layout() == Layout::TILE, "Can only untilize tile major data");
+        // select_program_factory rejects this pairing before it picks a sharded factory, and the
+        // shortcut never reaches it.
+        TT_FATAL(
+            !input_tensor.is_sharded() || !sub_core_grids.has_value(),
+            "Sharded untilize does not support sub core grid specification");
         // Built over the input's rank, matching the normalization above and the device operation's
         // output spec; output_tensor_end may be longer, and taking its rank would grow an axis.
         ttsl::SmallVector<uint32_t> empty_shape;
@@ -164,6 +169,27 @@ Tensor untilize_with_unpadding(
         // are on the width, or by div_up, and tolerate a height that is too large. Measured, all
         // three.
         auto output_mem_config = memory_config.value_or(input_tensor.memory_config());
+        // A caller may name a sharded layout without a spec (ttnn.L1_HEIGHT_SHARDED_MEMORY_CONFIG
+        // and friends). The device operation fills that in from the input for a same-layout output;
+        // without it the spec cannot be built at all ("MemoryConfig must have Shard Spec specified"),
+        // so an empty input failed where a non-empty one succeeded.
+        if (input_tensor.shard_spec().has_value() && output_mem_config.is_sharded() &&
+            !output_mem_config.shard_spec().has_value() &&
+            output_mem_config.memory_layout() == input_tensor.memory_config().memory_layout()) {
+            output_mem_config = MemoryConfig(
+                output_mem_config.memory_layout(), output_mem_config.buffer_type(), input_tensor.shard_spec().value());
+        }
+        // A height-sharded input can only produce a height-sharded output; the device operation
+        // rejects any other sharded output and TensorSpec does not, because it checks the output's
+        // own geometry rather than whether the conversion is supported.
+        if (input_tensor.shard_spec().has_value() &&
+            input_tensor.memory_config().memory_layout() == TensorMemoryLayout::HEIGHT_SHARDED &&
+            output_mem_config.is_sharded()) {
+            TT_FATAL(
+                output_mem_config.memory_layout() == TensorMemoryLayout::HEIGHT_SHARDED,
+                "Output memory config layout must be HEIGHT_SHARDED when output is sharded but got {}",
+                output_mem_config.memory_layout());
+        }
         if (output_mem_config.memory_layout() == TensorMemoryLayout::WIDTH_SHARDED &&
             output_mem_config.shard_spec().has_value()) {
             uint32_t fused_height = 1;

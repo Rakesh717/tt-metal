@@ -175,6 +175,23 @@ ttnn::Tensor untilize(
         // Without it a ROW_MAJOR tensor is accepted only because it is empty, while the same tensor
         // at any non-zero size is rejected - measured, both ops.
         TT_FATAL(input_tensor.layout() == Layout::TILE, "Can only untilize tile major data");
+        // Same reason, for the sub_core_grids arguments. untilize_native sends a tensor to the
+        // native prim when it is sharded or already unpadded, and to untilize_with_unpadding
+        // otherwise; only the first of those validates these three, so repeat them under the same
+        // condition rather than for every empty input.
+        const bool takes_native_untilize =
+            input_tensor.is_sharded() || input_tensor.logical_shape() == input_tensor.padded_shape();
+        if (takes_native_untilize && sub_core_grids.has_value()) {
+            TT_FATAL(
+                input_tensor.memory_config().memory_layout() == TensorMemoryLayout::INTERLEAVED,
+                "Input memory layout must be interleaved when sub_core_grid argument provided");
+            TT_FATAL(
+                memory_config.value_or(input_tensor.memory_config()).memory_layout() == TensorMemoryLayout::INTERLEAVED,
+                "Output memory layout must be interleaved when sub_core_grid argument provided");
+            TT_FATAL(
+                use_multicore,
+                "sub_core_grid implementation only supported when use_multicore flag argument is set to true");
+        }
         return create_device_tensor(
             tt::tt_metal::TensorSpec(
                 input_tensor.logical_shape(),

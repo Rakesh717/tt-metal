@@ -111,9 +111,20 @@ Tensor untilize_with_unpadding(
     // indices, so the produced extent is end + 1 per dim; for an empty dim that end is the uint32
     // wrap of 0 - 1, and + 1 returns it to 0.
     if (input_tensor.logical_volume() == 0) {
+        // device() is null for a host or unallocated tensor and create_device_tensor dereferences
+        // it, so say so here rather than segfaulting. The normal path reaches the device
+        // operation's own validation instead.
+        TT_FATAL(
+            input_tensor.device() != nullptr, "untilize_with_unpadding: input tensor must be allocated on a device");
+        // The shortcut skips the device operation's validation, so repeat its layout check here.
+        // Without it a ROW_MAJOR tensor is accepted only because it is empty, while the same tensor
+        // at any non-zero size is rejected - measured, both ops.
+        TT_FATAL(input_tensor.layout() == Layout::TILE, "Can only untilize tile major data");
+        // Built over the input's rank, matching the normalization above and the device operation's
+        // output spec; output_tensor_end may be longer, and taking its rank would grow an axis.
         ttsl::SmallVector<uint32_t> empty_shape;
-        empty_shape.reserve(output_tensor_end.rank());
-        for (size_t index = 0; index < output_tensor_end.rank(); ++index) {
+        empty_shape.reserve(input_shape.rank());
+        for (size_t index = 0; index < input_shape.rank(); ++index) {
             empty_shape.push_back(output_tensor_end[index] + 1);
         }
         const ttnn::Shape output_shape(std::move(empty_shape));
@@ -124,6 +135,46 @@ Tensor untilize_with_unpadding(
             output_shape.volume() == 0,
             "untilize_with_unpadding: a zero-volume input requires a zero-volume output, got {}",
             output_shape);
+        // Unpadding only ever shrinks, so no extent may exceed the padded input. Volume alone does
+        // not catch that: [0, 64] with ends [0, UINT32_MAX] is zero-volume but shaped [1, 0].
+        for (size_t index = 0; index < input_shape.rank(); ++index) {
+            TT_FATAL(
+                output_shape[index] <= input_tensor.padded_shape()[index],
+                "untilize_with_unpadding: output extent {} exceeds the padded input extent {} in "
+                "dimension {}",
+                output_shape[index],
+                input_tensor.padded_shape()[index],
+                index);
+        }
+        // What this shortcut will and will not do, since it stands in for the device operation's
+        // own output-spec derivation: it must not accept a request the normal path rejects as
+        // invalid, and it does not try to support one the normal path cannot do at all. A
+        // zero-WIDTH output is the second kind - the non-empty twin SIGFPEs for a height-sharded
+        // input and hangs the device for an interleaved one - so it is left to fail here too,
+        // with the spec's own error. Swept empty against non-empty across interleaved, HEIGHT,
+        // WIDTH and BLOCK sharding, for both an identity unpad and a height-shrinking one: the
+        // WIDTH_SHARDED shard height below was the only divergence.
+        // A WIDTH_SHARDED spec pins the shard height to the tensor's physical height exactly
+        // (tensor_spec.cpp), and untilizing shrinks that height from the tile-padded one to the
+        // logical one, so the input's shard spec cannot be carried over unchanged - [32, 0] sharded
+        // [32, 32], unpadded to [4, 0], is rejected for a shard height of 32 against a physical
+        // height of 4. The device operation reshapes the shard the same way for a non-empty input;
+        // its fused height is volume() / shape[-1], which is 0 / 0 here, so take the product of the
+        // leading dims instead. HEIGHT_SHARDED and BLOCK_SHARDED need no adjustment: their checks
+        // are on the width, or by div_up, and tolerate a height that is too large. Measured, all
+        // three.
+        auto output_mem_config = memory_config.value_or(input_tensor.memory_config());
+        if (output_mem_config.memory_layout() == TensorMemoryLayout::WIDTH_SHARDED &&
+            output_mem_config.shard_spec().has_value()) {
+            uint32_t fused_height = 1;
+            for (size_t index = 0; index + 1 < output_shape.rank(); ++index) {
+                fused_height *= output_shape[index];
+            }
+            ShardSpec output_shard_spec = output_mem_config.shard_spec().value();
+            output_shard_spec.shape = {fused_height, output_shard_spec.shape[1]};
+            output_mem_config =
+                MemoryConfig(output_mem_config.memory_layout(), output_mem_config.buffer_type(), output_shard_spec);
+        }
         // Allocated rather than filled: there is no element to initialise, and going through a host
         // tensor would upload to the device, which fails outright inside trace capture and drops the
         // input's mesh topology on the way. Carry that topology across instead.
@@ -131,9 +182,7 @@ Tensor untilize_with_unpadding(
             tt::tt_metal::TensorSpec(
                 output_shape,
                 tt::tt_metal::TensorLayout(
-                    output_dtype,
-                    tt::tt_metal::PageConfig(Layout::ROW_MAJOR),
-                    memory_config.value_or(input_tensor.memory_config()))),
+                    output_dtype, tt::tt_metal::PageConfig(Layout::ROW_MAJOR), output_mem_config)),
             input_tensor.device(),
             input_tensor.tensor_topology());
     }

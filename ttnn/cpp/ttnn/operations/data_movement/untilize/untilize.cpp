@@ -167,6 +167,14 @@ ttnn::Tensor untilize(
     // to initialise, a host upload would fail inside trace capture, and this keeps the input's mesh
     // topology.
     if (input_tensor.logical_volume() == 0) {
+        // device() is null for a host or unallocated tensor and create_device_tensor dereferences
+        // it; without this the empty branch segfaults where the normal path would have fallen
+        // through to the device operation's validation error.
+        TT_FATAL(input_tensor.device() != nullptr, "untilize: input tensor must be allocated on a device");
+        // The shortcut skips the device operation's validation, so repeat its layout check here.
+        // Without it a ROW_MAJOR tensor is accepted only because it is empty, while the same tensor
+        // at any non-zero size is rejected - measured, both ops.
+        TT_FATAL(input_tensor.layout() == Layout::TILE, "Can only untilize tile major data");
         return create_device_tensor(
             tt::tt_metal::TensorSpec(
                 input_tensor.logical_shape(),

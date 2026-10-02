@@ -1648,6 +1648,9 @@
 - name: TT-DiT Wan2.2-T2V-A14B single galaxy e2e tests
   cmd: |
     unset HF_HUB_OFFLINE    # umt5 fetches the Wan2.2 tokenizer from the hub
+    # #58835: since #52893 the read-only pinned upload of ttnn.load_tensor mmaps is 2-3x slower on
+    # IOMMU hosts; the quad legs already run without the pinned cache, keep the single galaxy legs the same.
+    export TT_METAL_PINNED_MEMORY_CACHE_LIMIT_BYTES=0
     export NO_PROMPT=1
     export HF_HOME=/mnt/models/huggingface
     export TT_DIT_CACHE_DIR="$HOME/.cache/tt-dit"
@@ -1676,6 +1679,9 @@
 - name: TT-DiT Wan2.2-I2V-A14B single galaxy e2e tests
   cmd: |
     unset HF_HUB_OFFLINE    # umt5 fetches the Wan2.2 tokenizer from the hub
+    # #58835: since #52893 the read-only pinned upload of ttnn.load_tensor mmaps is 2-3x slower on
+    # IOMMU hosts; the quad legs already run without the pinned cache, keep the single galaxy legs the same.
+    export TT_METAL_PINNED_MEMORY_CACHE_LIMIT_BYTES=0
     export NO_PROMPT=1
     export HF_HOME=/mnt/models/huggingface
     export TT_DIT_CACHE_DIR="$HOME/.cache/tt-dit"
